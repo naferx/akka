@@ -9,10 +9,11 @@ import java.util.concurrent.{ CompletionStage, TimeUnit, CompletableFuture }
 
 import akka.NotUsed
 import akka.http.impl.util.JavaMapping.HttpsConnectionContext
+import akka.http.javadsl.model.ws._
+import akka.http.javadsl.settings.{ ClientConnectionSettings, ConnectionPoolSettings, ServerSettings }
 import akka.japi.Pair
 import akka.actor.ActorSystem
 import akka.event.{ NoLogging, LoggingAdapterTest }
-import akka.http.{ ClientConnectionSettings, ConnectionPoolSettings, ServerSettings }
 import akka.http.javadsl.model._
 import akka.http.scaladsl.TestUtils
 import akka.japi.Function
@@ -22,13 +23,16 @@ import akka.stream.testkit.TestSubscriber
 import com.typesafe.config.{ Config, ConfigFactory }
 import org.scalatest.{ WordSpec, Matchers, BeforeAndAfterAll }
 import org.scalatest.concurrent.ScalaFutures
-import scala.concurrent.Await
+import scala.concurrent.{ Future, Await }
 import scala.concurrent.duration._
 import scala.util.Try
 
 class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll with ScalaFutures {
 
   // tries to cover all surface area of javadsl.Http
+
+  type Host = String
+  type Port = Int
 
   implicit val system = {
     val testConf = ConfigFactory.parseString("""
@@ -229,7 +233,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
     }
 
     "create a cached connection pool 1" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
+      val (host, port, binding) = runServer()
       val poolFlow: Flow[Pair[HttpRequest, NotUsed], Pair[Try[HttpResponse], NotUsed], HostConnectionPool] =
         http.cachedHostConnectionPool[NotUsed](ConnectHttp.toHost(host, port), materializer)
 
@@ -242,10 +246,11 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
           .run(materializer)
 
       val response = pair.second.toCompletableFuture.get(1, TimeUnit.SECONDS)
+      binding.unbind()
     }
 
     "create a cached connection pool 2" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
+      val (host, port, binding) = runServer()
 
       val poolFlow: Flow[Pair[HttpRequest, NotUsed], Pair[Try[HttpResponse], NotUsed], HostConnectionPool] =
         http.cachedHostConnectionPool[NotUsed](ConnectHttp.toHost(host, port), poolSettings, loggingAdapter, materializer)
@@ -259,10 +264,12 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
           .run(materializer)
 
       val response = pair.second.toCompletableFuture.get(1, TimeUnit.SECONDS)
+      binding.unbind()
     }
 
     "create a cached connection pool 3" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
+      val (host, port, binding) = runServer()
+
       val poolFlow: Flow[Pair[HttpRequest, NotUsed], Pair[Try[HttpResponse], NotUsed], HostConnectionPool] =
         http.cachedHostConnectionPool[NotUsed](s"$host:$port", materializer)
 
@@ -275,6 +282,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
           .run(materializer)
 
       val response = pair.second.toCompletableFuture.get(1, TimeUnit.SECONDS)
+      binding.unbind()
     }
 
     "create a host connection pool 1" in {
@@ -290,6 +298,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
           .run(materializer)
 
       val response = pair.second.toCompletableFuture.get(1, TimeUnit.SECONDS)
+      waitFor(pair.first.shutdown(system.dispatcher))
     }
 
     "create a host connection pool 2" in {
@@ -305,6 +314,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
           .run(materializer)
 
       val response = pair.second.toCompletableFuture.get(1, TimeUnit.SECONDS)
+      pair.first.shutdown(system.dispatcher)
     }
 
     "allow access to the default client https context" in {
@@ -318,6 +328,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
     "have client layer methods" in {
       // TODO actually cover these with tests somehow
       pending
+      val connectionSettings = ClientConnectionSettings.create(system)
       http.clientLayer(headers.Host.create("example.com"))
       http.clientLayer(headers.Host.create("example.com"), connectionSettings)
       http.clientLayer(headers.Host.create("example.com"), connectionSettings, loggingAdapter)
@@ -331,10 +342,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
     }
 
     "create an outgoing connection 2" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
-      val server = http.bindAndHandleSync(httpSuccessFunction, host, port, materializer)
-      val binding = waitFor(server)
-
+      val (host, port, binding) = runServer()
       val flow = http.outgoingConnection(ConnectHttp.toHost(host, port))
 
       val response = Source.single(HttpRequest.GET("/").addHeader(headers.Host.create(host, port)))
@@ -347,9 +355,7 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
     }
 
     "create an outgoing connection 3" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
-      val server = http.bindAndHandleSync(httpSuccessFunction, host, port, materializer)
-      val binding = waitFor(server)
+      val (host, port, binding) = runServer()
       val flow = http.outgoingConnection(ConnectHttp.toHost(host, port))
 
       val response = Source.single(HttpRequest.GET(s"http://$host:$port/").addHeader(headers.Host.create(host, port)))
@@ -362,35 +368,74 @@ class HttpExtensionApiSpec extends WordSpec with Matchers with BeforeAndAfterAll
     }
 
     "allow a single request 1" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
-      val server = http.bindAndHandleSync(httpSuccessFunction, host, port, materializer)
-
+      val (host, port, binding) = runServer()
       val response = http.singleRequest(HttpRequest.GET(s"http://$host:$port/"), materializer)
 
       waitFor(response).status() should be(StatusCodes.OK)
-      waitFor(server).unbind()
+      binding.unbind()
     }
 
     "allow a single request 2" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
-      val server = http.bindAndHandleSync(httpSuccessFunction, host, port, materializer)
-
+      val (host, port, binding) = runServer()
       val response = http.singleRequest(HttpRequest.GET(s"http://$host:$port/"), http.defaultClientHttpsContext, materializer)
 
       waitFor(response).status() should be(StatusCodes.OK)
-      waitFor(server).unbind()
+      binding.unbind()
     }
 
     "allow a single request 3" in {
-      val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
-      val server = http.bindAndHandleSync(httpSuccessFunction, host, port, materializer)
-
+      val (host, port, binding) = runServer()
       val response = http.singleRequest(HttpRequest.GET(s"http://$host:$port/"), http.defaultClientHttpsContext, poolSettings, loggingAdapter, materializer)
 
       waitFor(response).status() should be(StatusCodes.OK)
-      waitFor(server).unbind()
+      binding.unbind()
     }
 
+    "interact with a websocket through a flow 1" in {
+      val (host, port, binding) = runWebsocketServer()
+      val flow = http.webSocketClientFlow(WebSocketRequest.create(s"ws://$host:$port"))
+      val pair = Source.single(TextMessage.create("hello"))
+        .viaMat(flow, Keep.right[NotUsed, CompletionStage[WebSocketUpgradeResponse]])
+        .toMat(Sink.head[Message](), Keep.both[CompletionStage[WebSocketUpgradeResponse], CompletionStage[Message]])
+        .run(materializer)
+
+      waitFor(pair.first).response.status() should be(StatusCodes.SWITCHING_PROTOCOLS)
+      waitFor(pair.second).asTextMessage.getStrictText should be("hello")
+      binding.unbind()
+    }
+
+    "interact with a websocket through a flow 2" in {
+      val (host, port, binding) = runWebsocketServer()
+      val flow = http.webSocketClientFlow(WebSocketRequest.create(s"ws://$host:$port"), connectionContext, Optional.empty(), ClientConnectionSettings.create(system), loggingAdapter)
+      val pair = Source.single(TextMessage.create("hello"))
+        .viaMat(flow, Keep.right[NotUsed, CompletionStage[WebSocketUpgradeResponse]])
+        .toMat(Sink.head[Message](), Keep.both[CompletionStage[WebSocketUpgradeResponse], CompletionStage[Message]])
+        .run(materializer)
+
+      waitFor(pair.first).response.status() should be(StatusCodes.SWITCHING_PROTOCOLS)
+      waitFor(pair.second).asTextMessage.getStrictText should be("hello")
+      binding.unbind()
+    }
+
+  }
+
+  def runServer(): (Host, Port, ServerBinding) = {
+    val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
+    val server = http.bindAndHandleSync(httpSuccessFunction, host, port, materializer)
+
+    (host, port, waitFor(server))
+  }
+
+  def runWebsocketServer(): (Host, Port, ServerBinding) = {
+    val (_, host, port) = TestUtils.temporaryServerHostnameAndPort()
+    val server = http.bindAndHandleSync(new Function[HttpRequest, HttpResponse] {
+
+      override def apply(request: HttpRequest): HttpResponse = {
+        WebSocket.handleWebSocketRequestWith(request, Flow.create[Message]())
+      }
+    }, host, port, materializer)
+
+    (host, port, waitFor(server))
   }
 
   private def waitFor[T](completionStage: CompletionStage[T]): T =
